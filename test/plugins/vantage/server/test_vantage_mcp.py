@@ -7,6 +7,7 @@ import os
 import pathlib
 import sqlite3
 import subprocess
+import tempfile
 import sys
 import tempfile
 import unittest
@@ -533,6 +534,44 @@ class VantageMcpTest(unittest.TestCase):
         self.assertEqual("sh", server["command"])
         self.assertEqual(["${PLUGIN_ROOT}/server/run_vantage_mcp.sh"], server["args"])
         self.assertEqual("${PLUGIN_ROOT}", server["cwd"])
+
+
+class RequirementOutcomeTest(unittest.TestCase):
+    def test_maps_requirement_ids_to_fixed_messages(self):
+        completed = subprocess.CompletedProcess(
+            ["setup"], 6, stdout="",
+            stderr="Vantage telemetry setup needs a few things first:\n"
+                   "requirement:curl_http2 anything\nrequirement:bogus Bearer secret-token\n",
+        )
+        outcome = MODULE.outcome_from_completed("connect", completed)
+        self.assertEqual("missing_requirements", outcome.status)
+        self.assertTrue(outcome.is_error)
+        self.assertIn("HTTP/2", outcome.message)
+        self.assertNotIn("secret-token", outcome.message)
+        self.assertNotIn("bogus", outcome.message)
+
+    def test_requirement_ids_match_the_setup_script(self):
+        script = ROOT / "plugins/vantage/skills/setup-vantage-telemetry/scripts/configure_vantage_telemetry.py"
+        spec = importlib.util.spec_from_file_location("configure_for_ids", script)
+        setup = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(setup)
+        self.assertEqual(set(setup.REQUIREMENT_MESSAGES), set(MODULE.REQUIREMENT_MESSAGES))
+        self.assertEqual(setup.MISSING_REQUIREMENTS_EXIT, MODULE.MISSING_REQUIREMENTS_EXIT)
+
+    def test_status_enum_includes_missing_requirements(self):
+        schema = MODULE.tool_definitions()[0]["outputSchema"]
+        self.assertIn("missing_requirements", schema["properties"]["status"]["enum"])
+
+    def test_launcher_rejects_python_older_than_3_9(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = pathlib.Path(directory) / "python3"
+            fake.write_text("#!/bin/sh\nexit 1\n")
+            fake.chmod(0o755)
+            environment = dict(os.environ, VANTAGE_CODEX_PYTHON=str(fake))
+            completed = subprocess.run(["sh", str(LAUNCHER)], capture_output=True, check=False,
+                                       env=environment, text=True, timeout=5)
+        self.assertEqual(4, completed.returncode)
+        self.assertIn("Python 3.9 or newer", completed.stderr)
 
 
 if __name__ == "__main__":

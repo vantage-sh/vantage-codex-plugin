@@ -9,6 +9,10 @@ Call the bundled `connect_vantage_telemetry` tool. If its status is `pending`, c
 
 When the user asks to check Vantage setup, call `check_vantage_telemetry_setup` first. If it returns `not_started`, explain that the previous local setup process stopped or expired and call `connect_vantage_telemetry` to start again. If it returns `pending`, check up to three times before handing control back in the same way.
 
+If a status is `missing_requirements`, tell the user setup did not start, list each item from the tool's message with how to install it, and ask them to reply `set up Vantage telemetry` once they have. Do not install software yourself unless the user asks you to.
+
+If the Vantage setup tools are unavailable, or report that Python is required, tell the user that Vantage telemetry needs Python 3.9 or newer and curl with HTTP/2 on macOS or Linux (on Windows, inside WSL). Ask them to install Python 3 (for example from python.org, `brew install python`, or `sudo apt install python3`), restart Codex, and ask again.
+
 Do not run setup scripts directly, construct authorization URLs, or request or expose credentials.
 
 Only when the user explicitly asks to remove Vantage telemetry, call the bundled `remove_vantage_telemetry` tool and report its result.

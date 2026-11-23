@@ -20,6 +20,28 @@ SETUP_SCRIPT = (
 )
 
 
+MISSING_REQUIREMENTS_EXIT = 6
+# Fixed messages keyed by the IDs the setup script reports. The server never
+# returns the script's own output, so only these known IDs reach the agent.
+REQUIREMENT_MESSAGES = {
+    "python_version": "Install Python 3.9 or newer (or set VANTAGE_CODEX_PYTHON to one).",
+    "sqlite": "Install a Python 3 build that includes the sqlite3 module.",
+    "windows": "Vantage attribution needs macOS or Linux. On Windows, run Codex inside WSL.",
+    "curl_missing": "Install curl (for example `brew install curl` or `sudo apt install curl`).",
+    "curl_http2": "Install a curl build with HTTP/2 support (nghttp2); the current curl lacks it.",
+}
+
+
+def requirement_ids(stderr):
+    ids = []
+    for line in (stderr or "").splitlines():
+        if line.startswith("requirement:"):
+            problem = line[len("requirement:"):].split(" ", 1)[0]
+            if problem in REQUIREMENT_MESSAGES and problem not in ids:
+                ids.append(problem)
+    return ids
+
+
 def plugin_version():
     try:
         payload = json.loads(PLUGIN_MANIFEST.read_text(encoding="utf-8"))
@@ -79,11 +101,22 @@ def outcome_from_completed(action, completed):
             True,
         )
 
+    if completed.returncode == MISSING_REQUIREMENTS_EXIT:
+        problems = requirement_ids(completed.stderr)
+        steps = " ".join("- %s" % REQUIREMENT_MESSAGES[problem] for problem in problems)
+        return SetupOutcome(
+            "missing_requirements",
+            "Vantage telemetry can't be set up until these are installed: %s "
+            "Then run setup again." % (steps or "- Check that Python 3.9+ and curl with HTTP/2 are installed."),
+            False,
+            True,
+        )
+
     messages = {
         1: "Codex telemetry configuration could not be read safely.",
         2: "Vantage sign-in or credential verification did not complete. Start setup again.",
         3: "Existing OpenTelemetry settings prevent automatic setup. Review your Codex telemetry configuration and retry.",
-        4: "Vantage telemetry setup requires Python 3.",
+        4: "Vantage telemetry setup requires Python 3.9 or newer.",
         5: "Vantage telemetry is connected, but its Codex hooks could not be installed safely. Review ~/.codex/hooks.json and retry setup.",
     }
     return SetupOutcome(
@@ -247,6 +280,7 @@ def tool_definitions():
                     "already_connected",
                     "removed",
                     "not_configured",
+                    "missing_requirements",
                     "error",
                 ],
             },

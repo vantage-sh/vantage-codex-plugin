@@ -15,6 +15,10 @@ if [ "$python_path" = "/usr/bin/python3" ] && command -v xcode-select >/dev/null
   fi
 fi
 
+if ! "$python_path" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+  exit 0
+fi
+
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 launcher="${script_dir}/run_vantage_codex_hook.py"
 [ -f "$launcher" ] || exit 0
