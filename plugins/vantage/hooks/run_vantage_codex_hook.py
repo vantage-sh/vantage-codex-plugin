@@ -84,6 +84,11 @@ def newest_hook(env=os.environ):
 
 
 def main():
+    if sys.version_info < (3, 9):
+        if sys.argv[1:]:
+            print("Vantage telemetry requires Python 3.9 or newer.", file=sys.stderr)
+            return 4
+        return 0
     hook = newest_hook()
     if hook is None:
         if sys.argv[1:]:

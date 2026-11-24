@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -115,6 +116,21 @@ class VantageCodexHookTest(unittest.TestCase):
         self.assertEqual(0, result.returncode)
         self.assertEqual("", result.stdout)
         self.assertEqual("", result.stderr)
+
+    def test_python_launcher_checks_version_for_hooks_and_explicit_commands(self):
+        launcher = SCRIPT.with_name("run_vantage_codex_hook.py")
+        for args, exit_code in [([], 0), (["tag"], 4)]:
+            with self.subTest(args=args):
+                stderr = io.StringIO()
+                with mock.patch.object(sys, "version_info", (3, 8)), \
+                        mock.patch.object(sys, "argv", [str(launcher), *args]), \
+                        mock.patch.object(sys, "stderr", stderr), self.assertRaises(SystemExit) as result:
+                    runpy.run_path(str(launcher), run_name="__main__")
+                self.assertEqual(exit_code, result.exception.code)
+                self.assertEqual(
+                    "Vantage telemetry requires Python 3.9 or newer.\n" if args else "",
+                    stderr.getvalue(),
+                )
 
     def test_launcher_resolves_an_explicit_plugin_root(self):
         environment = os.environ.copy()
