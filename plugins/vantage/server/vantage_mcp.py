@@ -30,15 +30,21 @@ REQUIREMENT_MESSAGES = {
     "curl_missing": "Install curl (for example `brew install curl` or `sudo apt install curl`).",
     "curl_http2": "Install a curl build with HTTP/2 support (nghttp2); the current curl lacks it.",
 }
+WARNING_MESSAGES = {
+    "git_attribution": (
+        "Install Git 2.31 or newer for repository, worktree, branch, and commit attribution. "
+        "Usage reporting and classifier tags can still work."
+    ),
+}
 
 
-def requirement_ids(stderr):
-    ids = []
+def notice_ids(stderr, prefix, messages):
+    ids = {}
     for line in (stderr or "").splitlines():
-        if line.startswith("requirement:"):
-            problem = line[len("requirement:"):].split(" ", 1)[0]
-            if problem in REQUIREMENT_MESSAGES and problem not in ids:
-                ids.append(problem)
+        if line.startswith(prefix):
+            notice = line[len(prefix):].split(" ", 1)[0]
+            if notice in messages:
+                ids[notice] = None
     return ids
 
 
@@ -85,24 +91,22 @@ def outcome_from_completed(action, completed):
                 "Vantage telemetry was removed. Restart Codex to apply the change.",
                 True,
             )
-        if "already configured" in output:
-            return SetupOutcome(
-                "already_connected",
-                "Vantage telemetry is already connected. Review and trust the Vantage "
-                "hooks in /hooks or Settings > Hooks. Restart Codex, then start a new chat. "
-                "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts.",
-                True,
-            )
+        already_connected = "already configured" in output
+        status = "already_connected" if already_connected else "connected"
+        connection = "already connected" if already_connected else "connected"
+        warnings = notice_ids(completed.stderr, "warning:", WARNING_MESSAGES)
+        warning_text = "".join("\n\n" + WARNING_MESSAGES[warning] for warning in warnings)
         return SetupOutcome(
-            "connected",
-            "Vantage telemetry is connected. Review and trust the Vantage hooks in "
+            status,
+            f"Vantage telemetry is {connection}. Review and trust the Vantage hooks in "
             "/hooks or Settings > Hooks. Restart Codex, then start a new chat. "
-            "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts.",
+            "After updating the Vantage plugin, rerun setup to refresh the copied hook scripts."
+            + warning_text,
             True,
         )
 
     if completed.returncode == MISSING_REQUIREMENTS_EXIT:
-        problems = requirement_ids(completed.stderr)
+        problems = notice_ids(completed.stderr, "requirement:", REQUIREMENT_MESSAGES)
         steps = " ".join("- %s" % REQUIREMENT_MESSAGES[problem] for problem in problems)
         return SetupOutcome(
             "missing_requirements",

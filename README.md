@@ -36,9 +36,13 @@ The current pre-release ingest destination is **ingest-staging.vantage.sh**.
 Setup writes the native OTLP logs exporter and the attribution sender's
 connection from the same endpoint and credential. The sender uses verified
 TLS and OTLP/gRPC. Its current implementation requires macOS or Linux,
-Python 3.9+, and curl with HTTP/2 support.
+Python 3.9+ with SQLite support, and curl with HTTP/2 support.
 
 ## What gets recorded
+
+Git 2.31 or newer is required for repository, worktree, branch, and commit
+attribution. If Git is missing or older, setup shows a warning and continues.
+Usage reporting and classifier tags can still work.
 
 Each user prompt opens a turn snapshot. The hook captures Git and developer
 identity observations (including the effective Git `user.name` and `user.email`), model request fingerprints, and classifier tags. Setup

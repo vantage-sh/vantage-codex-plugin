@@ -43,13 +43,20 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
         patcher = mock.patch.object(MODULE, "requirement_problems", return_value=[])
         patcher.start()
         self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(MODULE, "requirement_warnings", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_normal_home_installs_one_hook_and_shared_staging_connection(self):
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME":home, "CODEX_HOME":""}), mock.patch.object(sys, "argv", ["setup"]):
-            with mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", 1)), mock.patch.object(
+            stderr = io.StringIO()
+            with mock.patch.object(MODULE, "requirement_warnings", return_value=["git_attribution"]), \
+                    contextlib.redirect_stderr(stderr), \
+                    mock.patch.object(MODULE, "browser_sign_in", return_value=("verifier", 1)), mock.patch.object(
                 MODULE, "wait_for_setup_credentials", return_value=self.setup_credentials()
             ), mock.patch.object(MODULE, "verify_ingest_token"):
                 self.assertEqual(MODULE.main(), 0)
+            self.assertIn("warning:git_attribution", stderr.getvalue())
             root = pathlib.Path(home) / ".codex"
             config = (root / "config.toml").read_text()
             connection = root / "vantage/connection.json"
@@ -503,6 +510,18 @@ class RequirementChecksTest(unittest.TestCase):
         problems = MODULE.requirement_problems(version=(3, 11), os_name="nt", which=lambda _: None, run=run)
         self.assertEqual(["windows"], problems)
         run.assert_not_called()
+
+    def test_git_warning_uses_version_and_handles_missing_git(self):
+        for stdout, expected in [
+            ("git version 2.30.9\n", ["git_attribution"]),
+            ("git version 2.31.0\n", []),
+            ("git version 2.39.5 (Apple Git-154)\n", []),
+            ("git version 2.52.0.windows.1\n", []),
+        ]:
+            with self.subTest(stdout=stdout):
+                run = mock.Mock(return_value=mock.Mock(stdout=stdout, returncode=0))
+                self.assertEqual(expected, MODULE.requirement_warnings(run=run))
+        self.assertEqual(["git_attribution"], MODULE.requirement_warnings(run=mock.Mock(side_effect=FileNotFoundError)))
 
     def test_setup_stops_before_sign_in_when_requirements_are_missing(self):
         stderr = io.StringIO()

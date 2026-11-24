@@ -53,6 +53,7 @@ PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
 BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
 HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "run_vantage_codex_hook.py")
 MIN_PYTHON = (3, 9)
+MIN_GIT = (2, 31)
 MISSING_REQUIREMENTS_EXIT = 6
 REQUIREMENT_MESSAGES = {
     "python_version": "Python 3.9 or newer is required. Install a newer Python 3, or set VANTAGE_CODEX_PYTHON to one.",
@@ -60,6 +61,12 @@ REQUIREMENT_MESSAGES = {
     "windows": "Vantage attribution needs macOS or Linux. On Windows, run Codex inside WSL.",
     "curl_missing": "curl is not installed. Install curl (for example `brew install curl` or `sudo apt install curl`).",
     "curl_http2": "The installed curl does not support HTTP/2. Install a curl build with HTTP/2 (nghttp2).",
+}
+WARNING_MESSAGES = {
+    "git_attribution": (
+        "Install Git 2.31 or newer for repository, worktree, branch, and commit attribution. "
+        "Usage reporting and classifier tags can still work."
+    ),
 }
 
 
@@ -94,6 +101,17 @@ def requirement_problems(*, version=None, os_name=None, which=shutil.which, run=
     elif not curl_supports_http2(curl, run=run):
         problems.append("curl_http2")
     return problems
+
+
+def requirement_warnings(run=subprocess.run):
+    try:
+        completed = run(["git", "--version"], capture_output=True, text=True, timeout=0.5, check=False)
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        return ["git_attribution"]
+    version = re.match(r"git version ([0-9]+)\.([0-9]+)\b", completed.stdout)
+    if completed.returncode != 0 or not version or tuple(map(int, version.groups())) < MIN_GIT:
+        return ["git_attribution"]
+    return []
 
 
 def report_requirement_problems(problems, stream=None):
@@ -612,6 +630,8 @@ def main():
         if problems:
             report_requirement_problems(problems)
             return MISSING_REQUIREMENTS_EXIT
+        for warning in requirement_warnings():
+            print("warning:%s %s" % (warning, WARNING_MESSAGES[warning]), file=sys.stderr)
         if args.check_requirements:
             print("All Vantage telemetry requirements are installed.")
             return 0

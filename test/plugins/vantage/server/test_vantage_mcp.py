@@ -556,7 +556,21 @@ class RequirementOutcomeTest(unittest.TestCase):
         setup = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(setup)
         self.assertEqual(set(setup.REQUIREMENT_MESSAGES), set(MODULE.REQUIREMENT_MESSAGES))
+        self.assertEqual(setup.WARNING_MESSAGES, MODULE.WARNING_MESSAGES)
         self.assertEqual(setup.MISSING_REQUIREMENTS_EXIT, MODULE.MISSING_REQUIREMENTS_EXIT)
+
+    def test_git_warning_is_returned_with_success_using_fixed_text(self):
+        for stdout, status in [("configured", "connected"), ("already configured", "already_connected")]:
+            with self.subTest(status=status):
+                completed = subprocess.CompletedProcess(
+                    ["setup"], 0, stdout=stdout,
+                    stderr="warning:git_attribution untrusted token\nwarning:unknown untrusted output\n",
+                )
+                outcome = MODULE.outcome_from_completed("connect", completed)
+                self.assertEqual(status, outcome.status)
+                self.assertFalse(outcome.is_error)
+                self.assertIn("Git 2.31", outcome.message)
+                self.assertNotIn("untrusted", outcome.message)
 
     def test_status_enum_includes_missing_requirements(self):
         schema = MODULE.tool_definitions()[0]["outputSchema"]
