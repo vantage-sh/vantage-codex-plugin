@@ -1,0 +1,34 @@
+name: Tests
+
+on: [pull_request, push]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Expose the bundled MCP command
+        if: runner.os == 'Windows'
+        run: |
+          $interpreter = (Get-Command python.exe).Source
+          $aliasPath = Join-Path (Split-Path $interpreter) 'python3.exe'
+          if (!(Test-Path $aliasPath)) { Copy-Item $interpreter $aliasPath }
+      - name: Run Python tests
+        shell: python
+        run: |
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          for test in sorted(Path("test").rglob("test_*.py")):
+              subprocess.run([sys.executable, str(test)], check=True)

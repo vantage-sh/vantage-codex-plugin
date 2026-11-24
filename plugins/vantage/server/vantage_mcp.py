@@ -2,6 +2,7 @@
 """Dependency-free local MCP tools for Vantage telemetry setup."""
 
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -26,13 +27,12 @@ MISSING_REQUIREMENTS_EXIT = 6
 REQUIREMENT_MESSAGES = {
     "python_version": "Install Python 3.9 or newer (or set VANTAGE_CODEX_PYTHON to one).",
     "sqlite": "Install a Python 3 build that includes the sqlite3 module.",
-    "windows": "Vantage attribution needs macOS or Linux. On Windows, run Codex inside WSL.",
-    "curl_missing": "Install curl (for example `brew install curl` or `sudo apt install curl`).",
-    "curl_http2": "Install a curl build with HTTP/2 support (nghttp2); the current curl lacks it.",
+    "curl_missing": "Install an HTTP/2-enabled curl or set VANTAGE_CODEX_CURL to its full path.",
+    "curl_http2": "Install an HTTP/2-enabled curl and set VANTAGE_CODEX_CURL to its full path if needed.",
 }
 WARNING_MESSAGES = {
     "git_attribution": (
-        "Install Git 2.31 or newer for repository, worktree, branch, and commit attribution. "
+        "Install Git for repository, worktree, branch, and commit attribution. "
         "Usage reporting and classifier tags can still work."
     ),
 }
@@ -387,15 +387,31 @@ def set_turn_attribution(arguments):
         if not 1 <= len(value) <= 512 or any(ord(c) < 32 or ord(c) == 127 for c in value):
             raise ValueError("invalid classifier value")
         assignments.append(f"{key}={value}")
-    # Use the bundled writer so validation, replacement and delivery share the CLI transaction.
-    command = [sys.executable, "-I", str(PLUGIN_ROOT / "hooks/vantage_codex_hook.py"),
+    codex_home = pathlib.Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser()
+    launcher = codex_home / "vantage" / "hooks" / "run_vantage_codex_hook.py"
+    command = [sys.executable, "-I", str(launcher),
                "tag", "codex", *ids, "--source", "inferred", "--replace", *assignments]
     try:
         completed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
         saved = completed.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
+        errors = completed.stderr.rstrip().splitlines()
+        last_error = errors[-1] if errors else b""
+    except subprocess.TimeoutExpired:
         saved = False
-    message = "Turn attribution saved." if saved else "Could not save attribution. Check the turn reference and local telemetry setup."
+        last_error = b"timeout"
+    except OSError:
+        saved = False
+        last_error = b""
+    if saved:
+        message = "Turn attribution saved."
+    elif last_error == b"unknown turn" or last_error.endswith(b": error: unknown turn"):
+        message = "Vantage could not find that turn. Use the session and turn IDs from the current Vantage hook."
+    elif last_error == b"timeout":
+        message = "Saving turn attribution timed out."
+    elif last_error in {b"Run Vantage telemetry setup first.", b"Vantage attribution hook is not installed."} or not launcher.is_file():
+        message = "Set up Vantage telemetry before saving attribution."
+    else:
+        message = "Could not save turn attribution. Check local telemetry setup."
     return {"content": [{"type": "text", "text": message}], "isError": not saved}
 
 
@@ -552,5 +568,23 @@ def serve(input_stream=None, output_stream=None, runner=run_tool_action):
         stop_active_setup()
 
 
-if __name__ == "__main__":
+def main():
+    python_path = os.environ.get("VANTAGE_CODEX_PYTHON")
+    if python_path and os.path.realpath(python_path) != os.path.realpath(sys.executable):
+        command = [python_path, "-I", str(pathlib.Path(__file__).resolve())]
+        environment = os.environ.copy()
+        del environment["VANTAGE_CODEX_PYTHON"]
+        try:
+            return subprocess.call(command, env=environment)
+        except OSError:
+            print("Vantage could not start the Python interpreter set by VANTAGE_CODEX_PYTHON.", file=sys.stderr)
+            return 4
+    if sys.version_info < (3, 9):
+        print("Vantage telemetry requires Python 3.9 or newer.", file=sys.stderr)
+        return 4
     serve()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

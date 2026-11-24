@@ -1,7 +1,8 @@
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 import io
 import os
 import datetime
+import hashlib
 import json
 import time
 import sys
@@ -48,7 +49,7 @@ class HookTest(unittest.TestCase):
         classifier = self.root / "classifier.md"
         facts = {"worktree": worktree, "branch": branch, "head": head} if worktree else {}
         with patch.dict(os.environ, VANTAGE_CLASSIFIER_FILE=str(classifier)), patch.object(
-            store, "git_facts", return_value=facts
+            store, "git_observation", return_value=(facts, None)
         ), redirect_stdout(io.StringIO()) as output:
             handle(self.db, "codex", payload)
         return json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
@@ -181,6 +182,82 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("git.user.email", self.payloads()[-1])
         self.assertNotIn("git.user.name", self.payloads()[-1])
 
+    def test_post_tool_observes_git_changes_without_spawning_git_for_stable_refs(self):
+        git_environment = patch.dict(
+            os.environ,
+            {key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+            clear=True,
+        )
+        git_environment.start()
+        self.addCleanup(git_environment.stop)
+        repo = self.root / "repo"
+        tree = self.root / "worktree"
+
+        def git(cwd, *args):
+            return subprocess.check_output(["git", "-C", cwd, *args], text=True).strip()
+
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", "main")
+        git(repo, "config", "user.name", "Test User")
+        git(repo, "config", "user.email", "git@example.invalid")
+        git(repo, "remote", "add", "origin", "git@example.invalid:test/project.git")
+        git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        git(repo, "commit", "-qm", "initial", "--allow-empty")
+        git(repo, "worktree", "add", "-q", "-b", "emily/feature", tree)
+        git(repo, "pack-refs", "--all")
+        initial = git(tree, "rev-parse", "HEAD")
+        p = {"session_id": "s", "turn_id": "t", "cwd": str(tree), "cli_version": "test"}
+        with redirect_stdout(io.StringIO()):
+            handle(self.db, "codex", dict(p, hook_event_name="UserPromptSubmit"))
+        self.db.close()
+        self.db = store.connect()
+        self.addCleanup(self.db.close)
+
+        tool = dict(p, hook_event_name="PostToolUse", tool_name="Bash")
+        with patch.object(store, "run_git", wraps=store.run_git) as run_git:
+            handle(self.db, "codex", dict(p, hook_event_name="PreToolUse", tool_name="Bash"))
+            handle(self.db, "codex", dict(tool, tool_name="update_plan"))
+            handle(self.db, "codex", tool)
+            run_git.assert_not_called()
+            git(tree, "commit", "-qm", "advance", "--allow-empty")
+            advanced = git(tree, "rev-parse", "HEAD")
+            handle(self.db, "codex", tool)
+            self.assertEqual([call.args[1] for call in run_git.call_args_list], ["rev-parse"])
+            git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/emily/feature")
+            handle(self.db, "codex", tool)
+            git(tree, "checkout", "--detach", "-q", initial)
+            handle(self.db, "codex", tool)
+
+        states = json.loads(self.payloads()[-1]["state"])["git"]
+        facts = [state["facts"] for state in states]
+        self.assertEqual([fact["head"] for fact in facts], [initial, advanced, advanced, initial])
+        self.assertEqual([fact["branch"] for fact in facts], ["emily/feature"] * 3 + [""])
+        self.assertEqual({fact["repository"] for fact in facts}, {"example.invalid/test/project"})
+        self.assertIs(facts[1]["branch_is_default"], False)
+        self.assertIs(facts[2]["branch_is_default"], True)
+
+    def test_git_observation_resolves_relative_common_dir(self):
+        repo = self.root / "repo"
+        subdirectory = repo / "nested"
+        subdirectory.mkdir(parents=True)
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", repo, *args], text=True).strip()
+
+        git("init", "-q", "-b", "main")
+        git("remote", "add", "origin", "git@example.invalid:test/project.git")
+        git("-c", "user.name=Test User", "-c", "user.email=git@example.invalid",
+            "commit", "-qm", "initial", "--allow-empty")
+        head = git("rev-parse", "HEAD")
+        salt = b"fixture"
+        root_facts, _ = store.git_observation(self.db, str(repo), salt)
+        self.db.execute("DELETE FROM git_worktrees")
+        nested_facts, _ = store.git_observation(self.db, str(subdirectory), salt)
+        self.assertEqual(root_facts, nested_facts)
+        self.assertEqual(head, root_facts["head"])
+        self.assertEqual("main", root_facts["branch"])
+        self.assertEqual("example.invalid/test/project", root_facts["repository"])
+
     def test_request_model_switch_survives_retry(self):
         p = {"session_id": "s", "turn_id": "t", "hook_event_name": "PostModelRequest",
              "cli_version": "0.171.0", "status": "completed"}
@@ -265,8 +342,8 @@ class HookTest(unittest.TestCase):
         key = ("codex", "s", "t")
         store.enqueue(self.db, store.REQUEST, key, {"status":"completed"})
         initial = self.payloads()
-        with (store.STATE / "worker.lock").open("a") as lock:
-            store.fcntl.flock(lock, store.fcntl.LOCK_EX)
+        with (store.STATE / "worker.lock").open("a+b") as lock:
+            self.assertTrue(store.try_lock(lock))
             with patch.object(store.subprocess, "Popen") as spawn:
                 for _ in range(20):
                     launch(self.db, True)
@@ -280,6 +357,35 @@ class HookTest(unittest.TestCase):
             launch(self.db, foreground=True, force=True)
         self.assertEqual(send.call_args.args[1][0][1]["event_id"], initial[0]["event_id"])
         self.assertFalse(self.payloads())
+
+    def test_detached_sender_reacquires_lock_and_retains_failed_batch(self):
+        endpoint, token = "http://127.0.0.1:1", "fixture-token"
+        binding = hashlib.sha256((endpoint + "\0" + token).encode()).hexdigest()
+        vantage = self.root / "vantage"
+        vantage.mkdir()
+        (vantage / "connection.json").write_text(json.dumps({
+            "endpoint": endpoint, "token": token, "since_ns": 1,
+        }))
+        processes = []
+        popen = subprocess.Popen
+
+        def spawn(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with patch.object(store, "STATE", vantage / "outbox" / binding), closing(store.connect()) as db:
+            store.enqueue(db, store.REQUEST, ("codex", "s", "t"), {"status": "completed"})
+            with patch.dict(os.environ, CODEX_HOME=str(self.root),
+                            VANTAGE_CODEX_CURL=str(self.root / "missing-curl")), patch.object(
+                store.subprocess, "Popen", side_effect=spawn
+            ):
+                launch(db)
+            self.assertEqual(len(processes), 1)
+            with processes[0] as worker:
+                self.assertEqual(worker.wait(timeout=10), 0)
+            self.assertEqual(db.execute("SELECT failures FROM sender").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM outbox").fetchone()[0], 1)
 
     def test_recovery_handles_partial_lines_parent_history_and_retries(self):
         session = str(uuid.uuid4())

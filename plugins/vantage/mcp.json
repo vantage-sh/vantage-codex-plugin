@@ -3,8 +3,8 @@
   "mcpServers": {
     "vantage_local": {
       "type": "stdio",
-      "command": "sh",
-      "args": ["${PLUGIN_ROOT}/server/run_vantage_mcp.sh"],
+      "command": "python3",
+      "args": ["-I", "${PLUGIN_ROOT}/server/vantage_mcp.py"],
       "cwd": "${PLUGIN_ROOT}"
     }
   }

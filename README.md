@@ -32,16 +32,30 @@ the normal Codex home (`~/.codex`, or your existing `CODEX_HOME`) and merges
 the handlers into `hooks.json`. The stable launcher resolves the installed
 plugin hook. To disconnect, ask Codex to remove Vantage telemetry.
 
+If you configured telemetry with an earlier version, rerun setup and review
+the updated hooks to apply the shell and edit tool filter.
+
 The current pre-release ingest destination is **ingest-staging.vantage.sh**.
 Setup writes the native OTLP logs exporter and the attribution sender's
 connection from the same endpoint and credential. The sender uses verified
-TLS and OTLP/gRPC. Its current implementation requires macOS or Linux,
-Python 3.9+ with SQLite support, and curl with HTTP/2 support.
+TLS and OTLP/gRPC. The bundled tools start with `python3` on `PATH` and require
+Python 3.9+ with SQLite support and curl with HTTP/2 support.
+
+On Windows, use the [Python Install Manager](https://docs.python.org/3/using/windows.html)
+and confirm that `python3 --version` reports Python 3.9 or newer. The MCP
+server and installed Windows hooks use the same `python3` command.
+If `python3` opens the Microsoft Store, check that the Python Install Manager
+is installed and its app execution aliases are enabled. Check that
+`curl.exe --version` lists `HTTP2` under Features. If the bundled Windows curl
+lacks HTTP/2, install an [HTTP/2-enabled curl build](https://curl.se/windows/),
+set `VANTAGE_CODEX_CURL` to its full executable path, and restart Codex.
+Keep `CODEX_HOME` in a private directory in your Windows user profile so
+credentials inherit its access permissions.
 
 ## What gets recorded
 
-Git 2.31 or newer is required for repository, worktree, branch, and commit
-attribution. If Git is missing or older, setup shows a warning and continues.
+Repository, worktree, branch, and commit attribution use Git. If Git is
+unavailable, setup shows a warning and continues.
 Usage reporting and classifier tags can still work.
 
 Each user prompt opens a turn snapshot. The hook captures Git and developer
@@ -53,10 +67,14 @@ a branch preserve the classification. Detached checkouts use the commit, and
 outside Git the hook uses the working directory. A task change in the same
 checkout can override inherited tags with the plugin’s `set_turn_attribution` MCP tool.
 An unchanged follow-up requires no classifier read or tool call from the agent.
-The tool writes through the local plugin. Codex can ask for approval for this
-write. For unattended runs, authorize `vantage_local.set_turn_attribution`
+The tool writes through the same launcher that handles hook events. Codex can
+ask for approval for this write. For unattended runs, authorize `vantage_local.set_turn_attribution`
 in the host's tool approval settings before starting the session. When the host
 blocks the tool, new classifier tags cannot be saved.
+
+The hook checks for Git changes after shell and edit tools finish. It reuses
+local observations while the worktree's HEAD, current ref, and Git configuration
+are unchanged.
 
 Hooks commit evidence to a private SQLite outbox under
 `${CODEX_HOME:-~/.codex}/vantage/outbox`. One detached sender per connection

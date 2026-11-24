@@ -11,9 +11,9 @@ When the user asks to check Vantage setup, call `check_vantage_telemetry_setup` 
 
 If a status is `missing_requirements`, tell the user setup did not start, list each item from the tool's message with how to install it, and ask them to reply `set up Vantage telemetry` once they have. Do not install software yourself unless the user asks you to.
 
-If setup succeeds with a Git warning, report the successful connection and explain that Git 2.31 or newer is required for Git attribution.
+If setup succeeds with a Git warning, report the successful connection and explain how installing Git enables repository attribution.
 
-If the Vantage setup tools are unavailable, or report that Python is required, tell the user that Vantage telemetry needs Python 3.9 or newer and curl with HTTP/2 on macOS or Linux (on Windows, inside WSL). Ask them to install Python 3 (for example from python.org, `brew install python`, or `sudo apt install python3`), restart Codex, and ask again.
+If the Vantage setup tools are unavailable or report that Python is required, tell the user to install Python 3.9 or newer with SQLite support and make the `python3` command available. On Windows, suggest the Python Install Manager from python.org. Ask them to restart Codex and retry setup.
 
 Do not run setup scripts directly, construct authorization URLs, or request or expose credentials.
 

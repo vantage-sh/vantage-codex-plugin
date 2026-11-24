@@ -86,6 +86,9 @@ def newest_hook(env=os.environ):
 def main():
     hook = newest_hook()
     if hook is None:
+        if sys.argv[1:]:
+            print("Vantage attribution hook is not installed.", file=sys.stderr)
+            return 1
         return 0
     runpy.run_path(str(hook), run_name="__main__")
     return 0

@@ -31,8 +31,6 @@ CLAIM_ENDPOINT = os.environ.get(
 AUTHORIZATION_ENDPOINT = os.environ.get(
     "VANTAGE_CODEX_AUTHORIZATION_ENDPOINT", "https://console-staging.vantage.sh/codex/telemetry/authorize"
 )
-PLUGIN_VERSION = "0.5.0"
-USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 AUTHORIZATION_TIMEOUT = 60 * 60
 POLL_INTERVAL = 2
 MAX_POLL_INTERVAL = 10
@@ -50,21 +48,26 @@ OTEL_TABLE = re.compile(r"^\s*\[\s*otel\s*\]\s*(?:#.*)?$")
 OTEL_CONFIG = re.compile(r"^\s*(?:\[+\s*otel(?:\.|\s*\])|otel(?:\.|\s*=))")
 TOKEN = re.compile(r'authorization\s*=\s*"Bearer ([A-Za-z0-9._~+/=\-]{8,512})"')
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parents[3]
+try:
+    PLUGIN_VERSION = json.loads((PLUGIN_ROOT / "plugin.json").read_text(encoding="utf-8"))["version"]
+except (OSError, ValueError, TypeError, KeyError):
+    PLUGIN_VERSION = "unknown"
+if not isinstance(PLUGIN_VERSION, str) or not PLUGIN_VERSION:
+    PLUGIN_VERSION = "unknown"
+USER_AGENT = "vantage-codex-plugin/%s" % PLUGIN_VERSION
 BUNDLED_HOOKS_DIR = PLUGIN_ROOT / "hooks"
 HOOK_SCRIPT_NAMES = ("run_vantage_codex_hook.sh", "run_vantage_codex_hook.py")
 MIN_PYTHON = (3, 9)
-MIN_GIT = (2, 31)
 MISSING_REQUIREMENTS_EXIT = 6
 REQUIREMENT_MESSAGES = {
     "python_version": "Python 3.9 or newer is required. Install a newer Python 3, or set VANTAGE_CODEX_PYTHON to one.",
     "sqlite": "Python's sqlite3 module is missing. Install a Python 3 build that includes SQLite.",
-    "windows": "Vantage attribution needs macOS or Linux. On Windows, run Codex inside WSL.",
-    "curl_missing": "curl is not installed. Install curl (for example `brew install curl` or `sudo apt install curl`).",
-    "curl_http2": "The installed curl does not support HTTP/2. Install a curl build with HTTP/2 (nghttp2).",
+    "curl_missing": "curl is unavailable. Install an HTTP/2-enabled curl or set VANTAGE_CODEX_CURL to its full path.",
+    "curl_http2": "Install an HTTP/2-enabled curl and set VANTAGE_CODEX_CURL to its full path if needed.",
 }
 WARNING_MESSAGES = {
     "git_attribution": (
-        "Install Git 2.31 or newer for repository, worktree, branch, and commit attribution. "
+        "Install Git for repository, worktree, branch, and commit attribution. "
         "Usage reporting and classifier tags can still work."
     ),
 }
@@ -92,11 +95,8 @@ def requirement_problems(*, version=None, os_name=None, which=shutil.which, run=
         import sqlite3  # noqa: F401 - the attribution outbox needs it
     except ImportError:
         problems.append("sqlite")
-    if os_name == "nt":
-        problems.append("windows")
-        return problems
-    curl = which("curl")
-    if not curl:
+    curl = os.environ.get("VANTAGE_CODEX_CURL") or ("curl.exe" if os_name == "nt" else "curl")
+    if not which(curl):
         problems.append("curl_missing")
     elif not curl_supports_http2(curl, run=run):
         problems.append("curl_http2")
@@ -108,8 +108,7 @@ def requirement_warnings(run=subprocess.run):
         completed = run(["git", "--version"], capture_output=True, text=True, timeout=0.5, check=False)
     except (OSError, UnicodeError, subprocess.SubprocessError):
         return ["git_attribution"]
-    version = re.match(r"git version ([0-9]+)\.([0-9]+)\b", completed.stdout)
-    if completed.returncode != 0 or not version or tuple(map(int, version.groups())) < MIN_GIT:
+    if completed.returncode != 0 or not completed.stdout.startswith("git version "):
         return ["git_attribution"]
     return []
 
@@ -162,8 +161,8 @@ def hook_handler(event_name):
     handler = {
         "type": "command",
         "command": "sh %s" % shlex.quote(str(shell_script)),
-        "commandWindows": subprocess.list2cmdline(["python", "-I", str(python_script)]),
-        "timeout": 30,
+        "commandWindows": subprocess.list2cmdline(["python3", "-I", str(python_script)]),
+        "timeout": 3 if event_name == "SessionEnd" else 30,
         "statusMessage": (
             "Loading Vantage attribution"
             if event_name == "SessionStart"
@@ -179,9 +178,14 @@ def is_managed_hook(handler):
     if not isinstance(handler, dict):
         return False
     expected = hook_handler("SessionStart")
+    python_script = str(managed_hooks_dir() / "run_vantage_codex_hook.py")
+    legacy_windows = (
+        subprocess.list2cmdline(["python", "-I", python_script]),
+        subprocess.list2cmdline(["py", "-3", "-I", python_script]),
+    )
     return (
         handler.get("command") == expected["command"]
-        or handler.get("commandWindows") == expected["commandWindows"]
+        or handler.get("commandWindows") in (expected["commandWindows"], *legacy_windows)
     )
 
 
@@ -288,7 +292,8 @@ def copy_managed_hook_scripts():
 
 
 HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "PostModelRequest", "SubagentStart",
-               "PreToolUse", "PostToolUse", "Stop", "SessionEnd")
+               "PostToolUse", "Stop", "SessionEnd")
+POST_TOOL_MATCHER = r"^(Bash|Edit|Write|MultiEdit|exec_command|apply_patch|shell|shell_command)$"
 
 
 def save_connection(token):
@@ -304,9 +309,19 @@ def save_connection(token):
 def install_user_hooks():
     payload = load_user_hooks()
     hooks = dict(payload.get("hooks") or {})
+    if "PreToolUse" in hooks:
+        remaining, changed = remove_managed_hook_handlers(hooks["PreToolUse"])
+        if changed:
+            if remaining:
+                hooks["PreToolUse"] = remaining
+            else:
+                del hooks["PreToolUse"]
     for event_name in HOOK_EVENTS:
         groups, _changed = remove_managed_hook_handlers(hooks.get(event_name, []))
-        groups.append({"hooks": [hook_handler(event_name)]})
+        group = {"hooks": [hook_handler(event_name)]}
+        if event_name == "PostToolUse":
+            group["matcher"] = POST_TOOL_MATCHER
+        groups.append(group)
         hooks[event_name] = groups
     payload["hooks"] = hooks
 
@@ -338,7 +353,7 @@ def remove_user_hooks():
     payload = load_user_hooks()
     hooks = dict(payload.get("hooks") or {})
     changed = False
-    for event_name in HOOK_EVENTS:
+    for event_name in (*HOOK_EVENTS, "PreToolUse"):
         if event_name not in hooks:
             continue
         groups, event_changed = remove_managed_hook_handlers(hooks[event_name])
@@ -575,7 +590,10 @@ def verify_attribution_transport(token):
         hook["export"]("vantage-agent-hook", [], token=token,
                        endpoint=INGEST_ENDPOINT.removesuffix("/v1/logs").rstrip("/"))
     except (ImportError, OSError, RuntimeError, subprocess.SubprocessError) as error:
-        raise ValueError("Could not verify the authenticated gRPC logs endpoint.") from error
+        message = "Could not verify the authenticated gRPC logs endpoint."
+        if os.name == "nt":
+            message += " Use an HTTP/2-enabled curl.exe and set VANTAGE_CODEX_CURL to its full path."
+        raise ValueError(message) from error
 
 
 def verify_ingest_token(token):

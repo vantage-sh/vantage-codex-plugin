@@ -48,7 +48,8 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_normal_home_installs_one_hook_and_shared_staging_connection(self):
-        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME":home, "CODEX_HOME":""}), mock.patch.object(sys, "argv", ["setup"]):
+        profile_variable = "USERPROFILE" if os.name == "nt" else "HOME"
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {profile_variable: home, "CODEX_HOME": ""}), mock.patch.object(sys, "argv", ["setup"]):
             stderr = io.StringIO()
             with mock.patch.object(MODULE, "requirement_warnings", return_value=["git_attribution"]), \
                     contextlib.redirect_stderr(stderr), \
@@ -64,7 +65,8 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
             self.assertEqual("https://ingest-staging.vantage.sh", settings["endpoint"])
             self.assertIn(settings["endpoint"] + "/v1/logs", config)
             self.assertIn("Bearer " + settings["token"], config)
-            self.assertEqual(0o600, connection.stat().st_mode & 0o777)
+            if os.name != "nt":
+                self.assertEqual(0o600, connection.stat().st_mode & 0o777)
             self.assertEqual(MODULE.main(), 0)
             self.assertEqual(settings, json.loads(connection.read_text()))
             self.assertEqual(set(MODULE.HOOK_EVENTS), set(MODULE.load_user_hooks()["hooks"]))
@@ -286,8 +288,9 @@ class ConfigureVantageTelemetryTest(unittest.TestCase):
 
             self.assertEqual("classifier-token", token_path.read_text(encoding="utf-8"))
             self.assertEqual("# Current classifier\n", markdown_path.read_text(encoding="utf-8"))
-            self.assertEqual(0o600, token_path.stat().st_mode & 0o777)
-            self.assertEqual(0o600, markdown_path.stat().st_mode & 0o777)
+            if os.name != "nt":
+                self.assertEqual(0o600, token_path.stat().st_mode & 0o777)
+                self.assertEqual(0o600, markdown_path.stat().st_mode & 0o777)
 
     def test_default_command_refreshes_an_existing_vantage_exporter(self):
         config = """[otel]
@@ -372,16 +375,36 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     "SessionStart": [{"hooks": [{"type": "command", "command": "echo start"}]}],
                 }
             }
-            hooks_path.write_text(json.dumps(existing), encoding="utf-8")
-
             with mock.patch.dict(os.environ, {"CODEX_HOME": codex_home}):
+                previous = json.loads(json.dumps(existing))
+                unrelated_pre_hook = {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo pre"}]}
+                legacy_windows = MODULE.subprocess.list2cmdline([
+                    "python", "-I", str(MODULE.managed_hooks_dir() / "run_vantage_codex_hook.py"),
+                ])
+                previous["hooks"]["PreToolUse"] = [unrelated_pre_hook, {
+                    "hooks": [{"type": "command", "commandWindows": legacy_windows}],
+                }]
+                previous["hooks"]["PostToolUse"].append({"hooks": [MODULE.hook_handler("PostToolUse")]})
+                legacy_py = MODULE.subprocess.list2cmdline([
+                    "py", "-3", "-I", str(MODULE.managed_hooks_dir() / "run_vantage_codex_hook.py"),
+                ])
+                previous["hooks"]["SessionEnd"] = [{
+                    "hooks": [{"type": "command", "commandWindows": legacy_py, "timeout": 30}],
+                }]
+                hooks_path.write_text(json.dumps(previous), encoding="utf-8")
                 MODULE.install_user_hooks()
                 installed = pathlib.Path(codex_home) / "vantage" / "hooks"
                 for name in MODULE.HOOK_SCRIPT_NAMES:
                     (installed / name).write_bytes(b"stale hook script")
                 MODULE.install_user_hooks()
                 payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+                self.assertEqual([unrelated_pre_hook], payload["hooks"]["PreToolUse"])
                 self.assertEqual(existing["hooks"]["PostToolUse"], payload["hooks"]["PostToolUse"][:1])
+                matcher = payload["hooks"]["PostToolUse"][-1]["matcher"]
+                self.assertRegex("Bash", matcher)
+                self.assertRegex("apply_patch", matcher)
+                self.assertNotRegex("mcp__example__read", matcher)
+                self.assertTrue(payload["hooks"]["PostToolUse"][-1]["hooks"][0]["commandWindows"].startswith("python3 -I "))
                 self.assertEqual("echo start", payload["hooks"]["SessionStart"][0]["hooks"][0]["command"])
                 for event_name in MODULE.HOOK_EVENTS:
                     managed = [
@@ -391,6 +414,9 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                         if MODULE.is_managed_hook(handler)
                     ]
                     self.assertEqual(1, len(managed))
+                    if event_name == "SessionEnd":
+                        self.assertEqual(3, managed[0]["timeout"])
+                        self.assertEqual(1, len(payload["hooks"][event_name]))
                 self.assertIn(
                     "run_vantage_codex_hook.py",
                     json.dumps(payload["hooks"]),
@@ -407,7 +433,8 @@ exporter = { otlp-http = { endpoint = "https://example.com/v1/logs" } }
                     (MODULE.BUNDLED_HOOKS_DIR / name).read_bytes(),
                     destination.read_bytes(),
                 )
-                self.assertTrue(destination.stat().st_mode & 0o100)
+                if os.name != "nt":
+                    self.assertTrue(destination.stat().st_mode & 0o100)
 
     def test_remove_user_hooks_preserves_unrelated_hooks(self):
         with tempfile.TemporaryDirectory() as codex_home:
@@ -505,15 +532,19 @@ class RequirementChecksTest(unittest.TestCase):
         )
         self.assertEqual(["curl_http2"], problems)
 
-    def test_reports_windows_without_probing_curl(self):
-        run = mock.Mock()
-        problems = MODULE.requirement_problems(version=(3, 11), os_name="nt", which=lambda _: None, run=run)
-        self.assertEqual(["windows"], problems)
-        run.assert_not_called()
+    def test_windows_checks_the_configured_curl(self):
+        executable = r"C:\Tools\curl.exe"
+        which = mock.Mock(return_value=executable)
+        run = self.curl_version("HTTP2")
+        with mock.patch.dict(os.environ, VANTAGE_CODEX_CURL=executable):
+            problems = MODULE.requirement_problems(version=(3, 11), os_name="nt", which=which, run=run)
+        self.assertEqual([], problems)
+        which.assert_called_once_with(executable)
+        self.assertEqual([executable, "-V"], run.call_args.args[0])
 
     def test_git_warning_uses_version_and_handles_missing_git(self):
         for stdout, expected in [
-            ("git version 2.30.9\n", ["git_attribution"]),
+            ("git version 2.30.9\n", []),
             ("git version 2.31.0\n", []),
             ("git version 2.39.5 (Apple Git-154)\n", []),
             ("git version 2.52.0.windows.1\n", []),
@@ -525,19 +556,19 @@ class RequirementChecksTest(unittest.TestCase):
 
     def test_setup_stops_before_sign_in_when_requirements_are_missing(self):
         stderr = io.StringIO()
-        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME": home, "CODEX_HOME": ""}), \
+        with tempfile.TemporaryDirectory() as codex_dir, mock.patch.dict(os.environ, CODEX_HOME=codex_dir), \
                 mock.patch.object(sys, "argv", ["setup"]), \
                 mock.patch.object(MODULE, "requirement_problems", return_value=["curl_missing"]), \
                 mock.patch.object(MODULE, "browser_sign_in") as sign_in, contextlib.redirect_stderr(stderr):
             self.assertEqual(MODULE.MISSING_REQUIREMENTS_EXIT, MODULE.main())
-            self.assertFalse((pathlib.Path(home) / ".codex/config.toml").exists())
+            self.assertFalse((pathlib.Path(codex_dir) / "config.toml").exists())
         sign_in.assert_not_called()
         self.assertIn("requirement:curl_missing ", stderr.getvalue())
 
     def test_remove_works_even_when_requirements_are_missing(self):
-        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME": home, "CODEX_HOME": ""}), \
+        with tempfile.TemporaryDirectory() as codex_dir, mock.patch.dict(os.environ, CODEX_HOME=codex_dir), \
                 mock.patch.object(sys, "argv", ["setup", "--remove"]), \
-                mock.patch.object(MODULE, "requirement_problems", return_value=["windows"]), \
+                mock.patch.object(MODULE, "requirement_problems", return_value=["curl_missing"]), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(0, MODULE.main())
 
