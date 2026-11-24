@@ -326,14 +326,18 @@ class HookTest(unittest.TestCase):
 
     def test_resume_refreshes_version_without_rewriting_historical_requests(self):
         payload = {"session_id": "session", "hook_event_name": "SessionStart"}
-        with patch.object(store, "installed_version", side_effect=["1.0", "2.0"]) as lookup:
+        with patch.object(store, "installed_version", side_effect=["1.0", "2.0"]) as lookup, patch.object(
+            store.time, "time_ns", return_value=10
+        ) as clock:
             handle(self.db, "codex", payload)
+            clock.return_value = 20
             handle(self.db, "codex", dict(payload, hook_event_name="PostModelRequest", turn_id="a"))
-            original_time = time.time_ns()
+            clock.return_value = 30
             handle(self.db, "codex", payload)
+            clock.return_value = 40
             handle(self.db, "codex", dict(payload, hook_event_name="PostModelRequest", turn_id="b"))
             store.correlation(self.db, ("codex", "session", "a"), {}, "rollout",
-                              status="completed", timestamp=original_time)
+                              status="completed", timestamp=25)
         self.assertEqual(lookup.call_count, 2)
         self.assertEqual([e["agent.version"] for e in self.payloads() if e["event.name"] == store.REQUEST],
                          ["1.0", "2.0", "1.0"])
