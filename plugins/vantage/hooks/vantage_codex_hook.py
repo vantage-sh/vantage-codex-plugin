@@ -312,6 +312,7 @@ def git_observation(db, cwd, salt, *, observe=True):
 
 REQUEST = "vantage.request_correlation"
 TURN = "vantage.turn_attribution"
+RATE_LIMIT = "vantage.rate_limit_snapshot"
 HOME = Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser().resolve()
 PLUGIN_MANIFEST = Path(__file__).resolve().parents[1] / "plugin.json"
 try:
@@ -565,9 +566,10 @@ def enqueue(db, kind, key, attrs, timestamp=None, event_id=None):
         "event_id": event_id,
         "agent": agent,
         "session.id": session,
-        "turn.id": turn,
         **attrs,
     }
+    if turn is not None:
+        payload["turn.id"] = turn
     if name:
         payload["git.user.name"] = name
     if email:
@@ -650,6 +652,11 @@ def project(db, session, offset, line):
             db.execute("INSERT OR REPLACE INTO versions_at VALUES ('codex',?,?,?)",
                        (session, int(when.timestamp() * 1e9), version))
         return
+    if entry.get("type") == "event_msg":
+        payload = entry.get("payload", {})
+        if payload.get("type") == "token_count":
+            project_rate_limit(db, session, entry["timestamp"], payload.get("rate_limits"))
+        return
     if entry.get("type") != "token_usage_record":
         return
     p = entry["payload"]
@@ -679,6 +686,22 @@ def project(db, session, offset, line):
         timestamp=ns,
         event_id=event_id,
     )
+
+
+def project_rate_limit(db, session, timestamp, limits):
+    if not isinstance(limits, dict) or not limits:
+        return
+    when = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))  # noqa: FURB162 -- Python 3.9
+    if when.tzinfo is None:
+        return
+    ns = int(when.timestamp() * 1e9)
+    if OPT_IN and ns < OPT_IN:
+        return
+    encoded = json.dumps(limits, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    # token_count events identify a session but carry no turn ID.
+    event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{RATE_LIMIT}:{session}:{timestamp}:{encoded}"))
+    enqueue(db, RATE_LIMIT, ("codex", session, None), {"rate_limits": encoded},
+            timestamp=ns, event_id=event_id)
 
 
 def recover(db, targets=None, *, after_chunk=None):

@@ -84,7 +84,10 @@ Hooks commit evidence to a private SQLite outbox under
 `${CODEX_HOME:-~/.codex}/vantage/outbox`. One detached sender per connection
 retries delivery. Session and turn lifecycle events trigger incremental
 recovery from Codex rollouts, including eligible threads created after setup
-whose hooks never fired. Billing continues to use native usage.
+whose hooks never fired. Recovery sends `vantage.rate_limit_snapshot` events for
+Codex `token_count` entries with rate limits. Each event carries the rollout
+timestamp, session ID, and the `rate_limits` object as a JSON string. Billing
+continues to use native usage.
 
 ## Measuring the outbox
 

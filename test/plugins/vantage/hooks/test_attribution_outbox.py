@@ -361,6 +361,58 @@ class HookTest(unittest.TestCase):
             recover(self.db)
         self.assertEqual([event["event.name"] for event in self.payloads()], [store.TURN, store.REQUEST])
 
+    def test_stop_recovers_and_exports_codex_rate_limit_snapshots(self):
+        session = str(uuid.uuid4())
+        folder = self.root / "sessions"
+        folder.mkdir()
+        path = folder / f"rollout-{session}.jsonl"
+        limits = {
+            "limit_id": "codex",
+            "primary": {"used_percent": 56.5, "window_minutes": 10080, "resets_at": 1795616148},
+            "secondary": None,
+            "credits": {"has_credits": False, "unlimited": False, "balance": None},
+            "plan_type": "self_serve_business_prolite",
+        }
+        reset = dict(limits, primary=dict(limits["primary"], used_percent=0.0, resets_at=1796222216))
+
+        def record(timestamp, rate_limits):
+            return {"timestamp": timestamp, "type": "event_msg", "payload": {
+                "type": "token_count", "rate_limits": rate_limits, "info": {"input_tokens": 123},
+            }}
+
+        first = record("2026-11-24T19:32:02.000Z", limits)
+        second = record("2026-11-25T14:52:42.000Z", reset)
+        path.write_text("".join(json.dumps(row) + "\n" for row in [
+            record("2026-11-23T00:00:00.000Z", limits),
+            record("2026-11-24T19:32:01.000Z", None),
+            first,
+            first,
+            second,
+        ]))
+        with patch.dict(os.environ, CODEX_HOME=str(self.root)):
+            handle(self.db, "codex", {
+                "session_id": session, "hook_event_name": "Stop", "cli_version": "test",
+            })
+        self.assertEqual(self.db.execute("SELECT session FROM recovery_queue").fetchall(), [(session,)])
+        cutoff = datetime.datetime(2026, 11, 24, tzinfo=datetime.timezone.utc)
+        with patch.object(store, "HOME", self.root), patch.object(
+            store, "OPT_IN", int(cutoff.timestamp()) * 10**9
+        ), patch.object(store, "SOURCE", "rollout"), patch.object(store, "export") as export:
+            store.send(self.db)
+        export.assert_called_once()
+        service, records = export.call_args.args
+        self.assertEqual(service, "vantage-agent-hook")
+        self.assertEqual([json.loads(event["rate_limits"]) for _, event in records], [limits, reset])
+        for (timestamp, event), row in zip(records, (first, second)):
+            observed = datetime.datetime.strptime(row["timestamp"], "%Y-%m-%dT%H:%M:%S.%fZ")
+            self.assertEqual(timestamp, int(observed.replace(tzinfo=datetime.timezone.utc).timestamp()) * 10**9)
+            self.assertEqual(event["event.name"], store.RATE_LIMIT)
+            self.assertEqual(event["session.id"], session)
+            self.assertEqual(event["vantage.capture.source"], "rollout")
+            self.assertNotIn("turn.id", event)
+            self.assertNotIn("input_tokens", json.dumps(event))
+        self.assertEqual(self.payloads(), [])
+
     def test_recovery_isolates_unreadable_file_and_keeps_cursor(self):
         folder = self.root / "sessions"
         folder.mkdir()
