@@ -84,7 +84,10 @@ Hooks commit evidence to a private SQLite outbox under
 `${CODEX_HOME:-~/.codex}/vantage/outbox`. One detached sender per connection
 retries delivery. Session and turn lifecycle events trigger incremental
 recovery from Codex rollouts, including eligible threads created after setup
-whose hooks never fired. Billing continues to use native usage.
+whose hooks never fired. Recovered Codex `vantage.request_correlation` events
+include the `rate_limits` object as a JSON string when the rollout contains a
+matching `token_count` entry or a single candidate with a rate-limit snapshot.
+Billing continues to use native usage.
 
 ## Measuring the outbox
 
@@ -105,6 +108,8 @@ python3 -I "$codexHome/vantage/hooks/run_vantage_codex_hook.py" recover
 ```
 
 `python_executable` reports the interpreter running the hook status command.
+`rollout_requests_missing_rate_limits` counts recovered Codex requests without
+a rate-limit snapshot and appears after the first miss.
 Run the `status` command above before a workload, while several agents are
 active, and again after Stop. Record the time along with `outbox`,
 `pending_recoveries`, `last_ack_unix_seconds`, `consecutive_send_failures`,
