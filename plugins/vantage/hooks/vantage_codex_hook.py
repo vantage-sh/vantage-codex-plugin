@@ -312,7 +312,6 @@ def git_observation(db, cwd, salt, *, observe=True):
 
 REQUEST = "vantage.request_correlation"
 TURN = "vantage.turn_attribution"
-RATE_LIMIT = "vantage.rate_limit_snapshot"
 HOME = Path(os.environ.get("CODEX_HOME") or "~/.codex").expanduser().resolve()
 PLUGIN_MANIFEST = Path(__file__).resolve().parents[1] / "plugin.json"
 try:
@@ -566,10 +565,9 @@ def enqueue(db, kind, key, attrs, timestamp=None, event_id=None):
         "event_id": event_id,
         "agent": agent,
         "session.id": session,
+        "turn.id": turn,
         **attrs,
     }
-    if turn is not None:
-        payload["turn.id"] = turn
     if name:
         payload["git.user.name"] = name
     if email:
@@ -622,13 +620,15 @@ def snapshot(
 
 
 def correlation(
-    db, key, usage, source, *, status, model=None, response=None, **options
+    db, key, usage, source, *, status, model=None, response=None, rate_limits=None, **options
 ):
     attrs = {"source": source, "status": status}
     if model:
         attrs["model"] = model
     if response:
         attrs["response_id"] = response
+    if rate_limits:
+        attrs["rate_limits"] = rate_limits
     for name in (
         "input_tokens",
         "cached_input_tokens",
@@ -642,7 +642,40 @@ def correlation(
     enqueue(db, REQUEST, key, attrs, **options)
 
 
-def project(db, session, offset, line):
+def following_rate_limits(stream, offset, usage):
+    # Codex writes the quota snapshot after the request, sometimes with tool
+    # or response items in between. Check both usage counters within that request.
+    resume = stream.tell()
+    try:
+        stream.seek(offset)
+        for _ in range(128):
+            line = stream.readline()
+            if not line.endswith(b"\n"):
+                break
+            entry = json.loads(line)
+            if entry.get("type") in ("token_usage_record", "turn_context", "session_meta"):
+                break
+            if entry.get("type") != "event_msg":
+                continue
+            payload = entry["payload"]
+            if payload.get("type") in ("task_started", "task_complete", "turn_aborted"):
+                break
+            if payload.get("type") != "token_count":
+                continue
+            info, limits = payload.get("info"), payload.get("rate_limits")
+            if (isinstance(info, dict) and isinstance(limits, dict) and limits
+                    and info.get("last_token_usage") == usage["usage"]
+                    and info.get("total_token_usage") == usage["thread_token_usage"]):
+                return json.dumps(limits, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (ValueError, TypeError, AttributeError, KeyError):
+        # A malformed companion record must not suppress the request itself.
+        return None
+    finally:
+        stream.seek(resume)
+    return None
+
+
+def project(db, session, offset, line, stream):
     entry = json.loads(line)
     if entry.get("type") == "session_meta":
         meta = entry.get("payload", {})
@@ -651,11 +684,6 @@ def project(db, session, offset, line):
             when = datetime.datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
             db.execute("INSERT OR REPLACE INTO versions_at VALUES ('codex',?,?,?)",
                        (session, int(when.timestamp() * 1e9), version))
-        return
-    if entry.get("type") == "event_msg":
-        payload = entry.get("payload", {})
-        if payload.get("type") == "token_count":
-            project_rate_limit(db, session, entry["timestamp"], payload.get("rate_limits"))
         return
     if entry.get("type") != "token_usage_record":
         return
@@ -683,25 +711,10 @@ def project(db, session, offset, line):
         status="completed",
         response=response,
         model=identifier(p.get("model")),
+        rate_limits=following_rate_limits(stream, offset + len(line), p) if p.get("thread_token_usage") else None,
         timestamp=ns,
         event_id=event_id,
     )
-
-
-def project_rate_limit(db, session, timestamp, limits):
-    if not isinstance(limits, dict) or not limits:
-        return
-    when = datetime.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))  # noqa: FURB162 -- Python 3.9
-    if when.tzinfo is None:
-        return
-    ns = int(when.timestamp() * 1e9)
-    if OPT_IN and ns < OPT_IN:
-        return
-    encoded = json.dumps(limits, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    # token_count events identify a session but carry no turn ID.
-    event_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{RATE_LIMIT}:{session}:{timestamp}:{encoded}"))
-    enqueue(db, RATE_LIMIT, ("codex", session, None), {"rate_limits": encoded},
-            timestamp=ns, event_id=event_id)
 
 
 def recover(db, targets=None, *, after_chunk=None):
@@ -748,7 +761,7 @@ def recover(db, targets=None, *, after_chunk=None):
                         with write(db):
                             for start, line in lines:
                                 try:
-                                    project(db, session, start, line)
+                                    project(db, session, start, line, stream)
                                 except (
                                     ValueError,
                                     KeyError,
