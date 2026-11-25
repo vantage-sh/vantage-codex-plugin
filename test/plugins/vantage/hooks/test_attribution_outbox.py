@@ -373,8 +373,8 @@ class HookTest(unittest.TestCase):
             "credits": {"has_credits": False, "unlimited": False, "balance": None},
         }
         reset = dict(limits, primary=dict(limits["primary"], used_percent=0.0, resets_at=1796222216))
-        usage = {"input_tokens": 8}
-        total = {"input_tokens": 16}
+        usage = {"input_tokens": 8, "output_tokens": 3, "cache_write_input_tokens": 0}
+        total = {"input_tokens": 16, "cached_input_tokens": 2}
         timestamp = "2026-11-25T14:52:42.000Z"
 
         def request(response, thread_usage=total):
@@ -383,10 +383,11 @@ class HookTest(unittest.TestCase):
                 "usage": usage, "thread_token_usage": thread_usage,
             }}
 
-        def quota(rate_limits, thread_usage=total):
+        def quota(rate_limits, thread_usage=None):
             return {"timestamp": timestamp, "type": "event_msg", "payload": {
                 "type": "token_count", "rate_limits": rate_limits,
-                "info": {"last_token_usage": usage, "total_token_usage": thread_usage},
+                "info": {"last_token_usage": {"input_tokens": 8, "output_tokens": 3, "total_tokens": 11},
+                         "total_token_usage": {"input_tokens": 16} if thread_usage is None else thread_usage},
             }}
 
         other = {"type": "response_item"}
@@ -398,10 +399,13 @@ class HookTest(unittest.TestCase):
             other,
             quota(limits),
             request("second", {"input_tokens": 24}),
-            quota(reset, {"input_tokens": 24}),
+            quota(reset, {"input_tokens": 25}),  # Single candidate fallback.
             request("third"),
             {"type": "event_msg", "payload": {"type": "task_complete"}},
             quota(limits),
+            request("fourth"),
+            quota(reset, {"input_tokens": 30}),
+            quota(limits, {"input_tokens": 31}),  # Multiple unmatched candidates.
         ]))
         with patch.dict(os.environ, CODEX_HOME=str(self.root)):
             handle(self.db, "codex", {
@@ -417,13 +421,30 @@ class HookTest(unittest.TestCase):
             self.assertEqual(service, "vantage-agent-hook")
             events.extend(event for _, event in records)
         self.assertEqual([event["event.name"] for event in events],
-                         [store.TURN, store.REQUEST, store.REQUEST, store.REQUEST])
-        self.assertEqual([event["response_id"] for event in events[1:]], ["first", "second", "third"])
+                         [store.TURN] + [store.REQUEST] * 4)
+        self.assertEqual([event["response_id"] for event in events[1:]],
+                         ["first", "second", "third", "fourth"])
         self.assertEqual([json.loads(event["rate_limits"]) for event in events[1:3]], [limits, reset])
         self.assertNotIn("rate_limits", events[3])
+        self.assertNotIn("rate_limits", events[4])
         self.assertTrue(all(event["session.id"] == session and event["turn.id"] == "t"
                             for event in events))
+        self.assertEqual(self.db.execute(
+            "SELECT count FROM diagnostics WHERE name='rollout_requests_missing_rate_limits'"
+        ).fetchone(), (2,))
         self.assertEqual(self.payloads(), [])
+
+    def test_rate_limit_lookahead_skips_json_parsing_for_tool_output(self):
+        tool_output = json.dumps({"type": "response_item", "payload": "x" * 200_000}).encode() + b"\n"
+        boundary = b'{"type":"turn_context"}\n'
+        quota = b'{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex"}}}\n'
+        with patch.object(store.json, "loads", wraps=json.loads) as decode:
+            self.assertIsNone(store.following_rate_limits(io.BytesIO(tool_output + boundary + quota), 0, {}))
+            decode.assert_called_once_with(boundary)
+            decode.reset_mock()
+            self.assertEqual(store.following_rate_limits(io.BytesIO(tool_output + quota), 0, {}),
+                             '{"limit_id":"codex"}')
+            decode.assert_called_once_with(quota)
 
     def test_recovery_isolates_unreadable_file_and_keeps_cursor(self):
         folder = self.root / "sessions"

@@ -642,9 +642,25 @@ def correlation(
     enqueue(db, REQUEST, key, attrs, **options)
 
 
-def following_rate_limits(stream, offset, usage):
+def matching_token_counts(request, info):
+    comparisons = []
+    for request_key, info_key in (("usage", "last_token_usage"),
+                                  ("thread_token_usage", "total_token_usage")):
+        left, right = request.get(request_key), info.get(info_key)
+        if isinstance(left, dict) and isinstance(right, dict):
+            comparisons.extend(
+                value == right[key]
+                for key, value in left.items()
+                if key.endswith("_tokens") and type(value) is int and type(right.get(key)) is int
+            )
+    return bool(comparisons) and all(comparisons)
+
+
+def following_rate_limits(stream, offset, request):
     # Codex writes the quota snapshot after the request, sometimes with tool
-    # or response items in between. Check both usage counters within that request.
+    # or response items in between.
+    status_lines = 0
+    fallback = None
     resume = stream.tell()
     try:
         stream.seek(offset)
@@ -652,27 +668,42 @@ def following_rate_limits(stream, offset, usage):
             line = stream.readline()
             if not line.endswith(b"\n"):
                 break
-            entry = json.loads(line)
+            if not any(marker in line for marker in (
+                b'"token_count"', b'"token_usage_record"', b'"task_',
+                b'"turn_context"', b'"session_meta"', b'"turn_aborted"',
+            )):
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
             if entry.get("type") in ("token_usage_record", "turn_context", "session_meta"):
                 break
             if entry.get("type") != "event_msg":
                 continue
-            payload = entry["payload"]
+            payload = entry.get("payload")
+            if not isinstance(payload, dict):
+                continue
             if payload.get("type") in ("task_started", "task_complete", "turn_aborted"):
                 break
             if payload.get("type") != "token_count":
                 continue
+            status_lines += 1
             info, limits = payload.get("info"), payload.get("rate_limits")
-            if (isinstance(info, dict) and isinstance(limits, dict) and limits
-                    and info.get("last_token_usage") == usage["usage"]
-                    and info.get("total_token_usage") == usage["thread_token_usage"]):
-                return json.dumps(limits, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    except (ValueError, TypeError, AttributeError, KeyError):
-        # A malformed companion record must not suppress the request itself.
-        return None
+            if not isinstance(limits, dict) or not limits:
+                continue
+            try:
+                encoded = json.dumps(limits, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            except ValueError:
+                continue
+            if isinstance(info, dict) and matching_token_counts(request, info):
+                return encoded
+            fallback = encoded
     finally:
         stream.seek(resume)
-    return None
+    return fallback if status_lines == 1 else None
 
 
 def project(db, session, offset, line, stream):
@@ -703,6 +734,12 @@ def project(db, session, offset, line, stream):
     snapshot(
         db, key, changes={"first_seen_ns": ns, "first_source": "rollout"}, timestamp=ns
     )
+    rate_limits = following_rate_limits(stream, offset + len(line), p)
+    if rate_limits is None:
+        db.execute(
+            "INSERT INTO diagnostics VALUES ('rollout_requests_missing_rate_limits',1) "
+            "ON CONFLICT(name) DO UPDATE SET count=count+1"
+        )
     correlation(
         db,
         key,
@@ -711,7 +748,7 @@ def project(db, session, offset, line, stream):
         status="completed",
         response=response,
         model=identifier(p.get("model")),
-        rate_limits=following_rate_limits(stream, offset + len(line), p) if p.get("thread_token_usage") else None,
+        rate_limits=rate_limits,
         timestamp=ns,
         event_id=event_id,
     )
