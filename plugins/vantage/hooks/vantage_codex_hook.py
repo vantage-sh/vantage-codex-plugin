@@ -278,13 +278,21 @@ def git_observation(db, cwd, salt, *, observe=True):
             head_stamp = None
 
     same_config = config_stamp is not None and config_stamp == cached.get("config_stamp")
-    if same_config:
-        identity, remote, default_ref = cached["metadata"]
+    if same_config and len(cached["metadata"]) == 4:
+        identity, remote, default_ref, login = cached["metadata"]
         identity = tuple(identity)
     else:
+        same_config = False
         identity, cache_config = git_config(cwd)
         remote_result = run_git(cwd, "remote", "get-url", "origin")
         remote = repository_name(remote_result.stdout.strip()) if remote_result and remote_result.returncode == 0 else ""
+        login = ""
+        if remote:
+            host = remote.split("/", 1)[0]
+            if re.fullmatch(r"[A-Za-z0-9.-]+", host):
+                candidate = git_output(cwd, "config", "--get", f"vantage.{host}.githubLogin")
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", candidate):
+                    login = candidate
         default_ref, cache_default = git_default_ref(cwd, layout)
         if not cache_config or not cache_default or remote_result is None:
             config_stamp = None
@@ -299,12 +307,14 @@ def git_observation(db, cwd, salt, *, observe=True):
             head_stamp = config_stamp = None
         if head_stamp is not None or config_stamp is not None:
             state = {"head_stamp": head_stamp, "facts": facts,
-                     "config_stamp": config_stamp, "metadata": [identity, remote, default_ref]}
+                     "config_stamp": config_stamp, "metadata": [identity, remote, default_ref, login]}
             db.execute("INSERT OR REPLACE INTO git_worktrees VALUES (?,?)", (key, json.dumps(state)))
 
     facts = dict(facts)
     if default_ref.startswith("origin/") and facts["branch"]:
         facts["branch_is_default"] = facts["branch"] == default_ref.removeprefix("origin/")
+    if login:
+        facts["github_login"] = login
     if remote:
         facts["repository"] = remote
     return facts, identity

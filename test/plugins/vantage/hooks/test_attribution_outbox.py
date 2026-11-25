@@ -318,6 +318,13 @@ class HookTest(unittest.TestCase):
         self.assertEqual(head, root_facts["head"])
         self.assertEqual("main", root_facts["branch"])
         self.assertEqual("example.invalid/test/project", root_facts["repository"])
+        self.assertNotIn("github_login", root_facts)
+        git("config", "vantage.example.invalid.githubLogin", "demo-user")
+        facts, _ = store.git_observation(self.db, str(repo), salt)
+        self.assertEqual("demo-user", facts["github_login"])
+        git("remote", "set-url", "origin", "git@other.invalid:test/project.git")
+        facts, _ = store.git_observation(self.db, str(repo), salt)
+        self.assertNotIn("github_login", facts)
 
     def test_request_model_switch_survives_retry(self):
         p = {"session_id": "s", "turn_id": "t", "hook_event_name": "PostModelRequest",

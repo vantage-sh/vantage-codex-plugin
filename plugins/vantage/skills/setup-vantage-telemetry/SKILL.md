@@ -18,3 +18,16 @@ If the Vantage setup tools are unavailable or report that Python is required, te
 Do not run setup scripts directly, construct authorization URLs, or request or expose credentials.
 
 Only when the user explicitly asks to remove Vantage telemetry, call the bundled `remove_vantage_telemetry` tool and report its result.
+
+## Automatic attribution
+
+After connecting, explain that `set_turn_attribution` saves the classifier tags for a turn. On its first approval prompt, selecting **Always allow** remembers the choice for this plugin and tool across sessions. For headless use, offer to configure the same setting in the user's Codex config. With their consent, use the installed plugin selector in place of `vantage@vantage-codex-plugin` below. Preserve existing config and restart Codex after editing.
+
+```toml
+[plugins."vantage@vantage-codex-plugin".mcp_servers.vantage_local.tools.set_turn_attribution]
+approval_mode = "approve"
+```
+
+In a Git checkout, determine the hostname of the origin fetch URL without displaying credentials. Use `gh auth status --active --json hosts --jq '.hosts[][] | {host,login}'` to find the active login for that exact host. Offer it as the GitHub handle for attribution and show the repository or host scope before saving. If no account matches, offer to use the handle the user confirms in Vantage's GitHub integration, or skip. Never infer a personal login from the repository owner or Git author name.
+
+With the user's confirmation, store the handle using `git config --local "vantage.<hostname>.githubLogin" "<login>"` in the checkout. If they choose a default for all repositories on this host, use `--global` instead. Repository settings override the host default for people using multiple accounts. Use validated host and login values as literal arguments. The hook reads the setting locally and never needs a GitHub token.
